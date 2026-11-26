@@ -1,0 +1,110 @@
+name: CI
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: capital_test
+          POSTGRES_USER: capital
+          POSTGRES_PASSWORD: ci-ephemeral-only
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U capital -d capital_test" --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: shivammathur/setup-php@d52fc211a0436f8839a587b3b5b8efddab4744ea # v2
+        with:
+          php-version: "8.4"
+          extensions: mbstring, pdo_pgsql, pdo_sqlite, redis, dom, xml, xmlwriter
+          coverage: none
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: composer install --no-interaction --prefer-dist
+      - run: cp .env.example .env && php artisan key:generate
+      - run: composer validate --strict
+      - run: php scripts/check-publication.php
+      - run: php scripts/check-phpdoc.php
+      - run: npm ci --ignore-scripts
+      - run: npm run format:check && npm run build
+      - run: vendor/bin/pint --test
+      - name: SQLite feature and unit tests
+        run: php artisan test --testsuite=Unit,Feature
+      - name: PostgreSQL feature tests and Redis cache
+        run: php artisan test --testsuite=Unit,Feature
+        env:
+          DB_CONNECTION: pgsql
+          DB_HOST: 127.0.0.1
+          DB_PORT: 5432
+          DB_DATABASE: capital_test
+          DB_USERNAME: capital
+          DB_PASSWORD: ci-ephemeral-only
+          CACHE_STORE: redis
+          REDIS_HOST: 127.0.0.1
+          REDIS_PASSWORD: "null"
+      - name: PostgreSQL and Redis round trips
+        run: php artisan test --testsuite=Integration
+        env:
+          RUN_INFRA_TESTS: "true"
+          DB_CONNECTION: pgsql
+          DB_HOST: 127.0.0.1
+          DB_PORT: 5432
+          DB_DATABASE: capital_test
+          DB_USERNAME: capital
+          DB_PASSWORD: ci-ephemeral-only
+          CACHE_STORE: redis
+          REDIS_HOST: 127.0.0.1
+          REDIS_PASSWORD: "null"
+      - run: composer audit
+      - run: npm audit --audit-level=high
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Create isolated demo configuration
+        run: |
+          cp .env.example .env
+          sed -i "s/^DB_PASSWORD=.*/DB_PASSWORD=$(openssl rand -hex 24)/" .env
+          sed -i "s/^DEMO_PASSWORD=.*/DEMO_PASSWORD=$(openssl rand -hex 24)/" .env
+          docker compose config --quiet
+      - run: docker compose build
+      - name: Generate key and start services
+        run: |
+          key=$(docker compose run --rm --no-deps app php artisan key:generate --show)
+          sed -i "s|^APP_KEY=.*|APP_KEY=$key|" .env
+          docker compose up -d --wait
+          docker compose exec -T app php artisan migrate --seed --force
+      - name: Verify application and Mailpit endpoints
+        run: |
+          curl --fail --retry 10 --retry-delay 2 http://localhost:8000/up
+          curl --fail http://localhost:8000/login > /dev/null
+          curl --fail http://localhost:8025/api/v1/info
+      - name: Verify SMTP delivery through Mailpit
+        run: docker compose exec -T app php scripts/check-mailpit.php
+      - name: Verify PostgreSQL and Redis from app container
+        run: |
+          docker compose exec -T postgres psql -U capital -d postgres -c 'CREATE DATABASE capital_test'
+          docker compose exec -T -e RUN_INFRA_TESTS=true -e DB_DATABASE=capital_test app php artisan test --testsuite=Integration
+      - name: Container status on failure
+        if: failure()
+        run: docker compose ps -a
+      - name: Stop isolated containers
+        if: always()
+        run: docker compose down --volumes

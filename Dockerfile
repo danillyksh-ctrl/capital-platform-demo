@@ -1,0 +1,18 @@
+FROM node:24-alpine AS frontend
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --ignore-scripts
+COPY resources ./resources
+COPY vite.config.js ./
+RUN npm run build
+
+FROM php:8.4-cli-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends libpq-dev libsqlite3-dev libzip-dev libonig-dev libxml2-dev unzip git && docker-php-ext-install pdo_pgsql pdo_sqlite mbstring zip dom xml xmlwriter && pecl install redis && docker-php-ext-enable redis && rm -rf /var/lib/apt/lists/*
+COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
+WORKDIR /app
+COPY . .
+RUN composer install --no-interaction --prefer-dist --optimize-autoloader && chown -R www-data:www-data storage bootstrap/cache
+COPY --from=frontend /app/public/build ./public/build
+USER www-data
+EXPOSE 8000
+CMD ["php", "artisan", "serve", "--host=0.0.0.0", "--port=8000"]
