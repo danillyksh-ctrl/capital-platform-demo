@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends libpq-dev libsq
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer
 WORKDIR /app
 COPY . .
-RUN composer install --no-interaction --prefer-dist --optimize-autoloader && chown -R www-data:www-data storage bootstrap/cache
+RUN composer install --no-interaction --prefer-dist --optimize-autoloader && touch .env && chown -R www-data:www-data storage bootstrap/cache
 COPY --from=frontend /app/public/build ./public/build
 USER www-data
 EXPOSE 8000
